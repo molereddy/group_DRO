@@ -1,13 +1,13 @@
-import os, csv
+import os, csv, pickle, torchvision
 import argparse
 import pandas as pd
 import torch
 import torch.nn as nn
 import torchvision
-
+from data.dro_dataset import get_loader
 from models import model_attributes
 from data.data import dataset_attributes, shift_types, prepare_data, log_data
-from utils import set_seed, Logger, CSVBatchLogger, log_args
+from utils import set_seed, Logger, CSVBatchLogger, log_args, get_model
 from train import train
 
 
@@ -58,9 +58,10 @@ def main():
     parser.add_argument('--minimum_variational_weight', type=float, default=0)
     # Misc
     parser.add_argument('--seed', type=int, default=0)
+    parser.add_argument('--widx', type=int, default=2)
+    parser.add_argument('--log_every', type=int, default=100)
     parser.add_argument('--show_progress', default=False, action='store_true')
     parser.add_argument('--log_dir', default='./logs')
-    parser.add_argument('--log_every', default=50, type=int)
     parser.add_argument('--save_step', type=int, default=10)
     parser.add_argument('--save_best', action='store_true', default=False)
     parser.add_argument('--save_last', action='store_true', default=False)
@@ -74,18 +75,23 @@ def main():
         args.adam_epsilon = 1e-8
         args.warmup_steps = 0
 
-    if os.path.exists(args.log_dir) and args.resume:
-        resume=True
-        mode='a'
+    resume=False
+    mode='w'
+    
+    if args.dataset == 'CelebA':
+        args.widx = 3
+        args.save_step = 5
+        args.log_every = (int(80 * 128 / args.batch_size)//10+1) * 30 # roughly 30720/batch_size
     else:
-        resume=False
-        mode='w'
-
+        args.widx = 2
+        args.save_step = 20
+        args.log_every = (int(10 * 128 / args.batch_size)//10+1) * 10 # roughly 1280/batch_size
+    args.log_dir = os.path.join(args.log_dir, args.dataset, args.model)
     ## Initialize logs
     if not os.path.exists(args.log_dir):
-        os.makedirs(args.log_dir)
+        os.makedirs(args.log_dir, exist_ok=True)
 
-    logger = Logger(os.path.join(args.log_dir, 'log.txt'), mode)
+    logger = Logger(os.path.join(args.log_dir, f'train.log'), mode)
     # Record args
     log_args(args, logger)
 
@@ -93,18 +99,22 @@ def main():
 
     # Data
     # Test data for label_shift_step is not implemented yet
-    test_data = None
-    test_loader = None
     if args.shift_type == 'confounder':
-        train_data, val_data, test_data = prepare_data(args, train=True)
-    elif args.shift_type == 'label_shift_step':
-        train_data, val_data = prepare_data(args, train=True)
+        # train_data, val_data, test_data = prepare_data(args, train=True)
+        with open(os.path.join('../distillation-group-analysis/results', args.dataset, 
+                               '_'.join([args.target_name] + list(map(str, args.confounder_names)) + \
+                                   ['dataset', f'{args.seed}.pkl'])
+                                ), 'rb') as file:
+            data = pickle.load(file)
+            train_data = data['train_data']
+            val_data = data['val_data']
+            test_data = data['test_data']
 
     loader_kwargs = {'batch_size':args.batch_size, 'num_workers':4, 'pin_memory':True}
-    train_loader = train_data.get_loader(train=True, reweight_groups=args.reweight_groups, **loader_kwargs)
-    val_loader = val_data.get_loader(train=False, reweight_groups=None, **loader_kwargs)
+    train_loader = get_loader(train_data, train=True, reweight_groups=args.reweight_groups, **loader_kwargs)
+    val_loader = get_loader(val_data, train=False, reweight_groups=None, **loader_kwargs)
     if test_data is not None:
-        test_loader = test_data.get_loader(train=False, reweight_groups=None, **loader_kwargs)
+        test_loader = get_loader(test_data, train=False, reweight_groups=None, **loader_kwargs)
 
     data = {}
     data['train_loader'] = train_loader
@@ -118,45 +128,7 @@ def main():
     log_data(data, logger)
 
     ## Initialize model
-    pretrained = not args.train_from_scratch
-    if resume:
-        model = torch.load(os.path.join(args.log_dir, 'last_model.pth'))
-        d = train_data.input_size()[0]
-    elif model_attributes[args.model]['feature_type'] in ('precomputed', 'raw_flattened'):
-        assert pretrained
-        # Load precomputed features
-        d = train_data.input_size()[0]
-        model = nn.Linear(d, n_classes)
-        model.has_aux_logits = False
-    elif args.model == 'resnet50':
-        model = torchvision.models.resnet50(pretrained=pretrained)
-        d = model.fc.in_features
-        model.fc = nn.Linear(d, n_classes)
-    elif args.model == 'resnet34':
-        model = torchvision.models.resnet34(pretrained=pretrained)
-        d = model.fc.in_features
-        model.fc = nn.Linear(d, n_classes)
-    elif args.model == 'wideresnet50':
-        model = torchvision.models.wide_resnet50_2(pretrained=pretrained)
-        d = model.fc.in_features
-        model.fc = nn.Linear(d, n_classes)
-    elif args.model == 'bert':
-        assert args.dataset == 'MultiNLI'
-
-        from pytorch_transformers import BertConfig, BertForSequenceClassification
-        config_class = BertConfig
-        model_class = BertForSequenceClassification
-
-        config = config_class.from_pretrained(
-            'bert-base-uncased',
-            num_labels=3,
-            finetuning_task='mnli')
-        model = model_class.from_pretrained(
-            'bert-base-uncased',
-            from_tf=False,
-            config=config)
-    else:
-        raise ValueError('Model not recognized.')
+    model = get_model(args.model)
 
     logger.flush()
 

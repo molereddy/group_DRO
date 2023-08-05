@@ -69,15 +69,19 @@ def run_epoch(epoch, model, optimizer, loader, loss_computer, logger, csv_logger
             if is_training and (batch_idx+1) % log_every==0:
                 csv_logger.log(epoch, batch_idx, loss_computer.get_stats(model, args))
                 csv_logger.flush()
-                loss_computer.log_stats(logger, is_training)
+                loss_computer.log_stats(logger, is_training, args.widx)
                 loss_computer.reset_stats()
 
-        if (not is_training) or loss_computer.batch_count > 0:
+        if not is_training:
+            csv_logger.log(epoch, batch_idx, loss_computer.get_stats(model, args))
+            csv_logger.flush()
+            return loss_computer.log_stats(logger, is_training, target_group_idx=args.widx)
+        
+        elif loss_computer.batch_count > 0:
             csv_logger.log(epoch, batch_idx, loss_computer.get_stats(model, args))
             csv_logger.flush()
             loss_computer.log_stats(logger, is_training)
-            if is_training:
-                loss_computer.reset_stats()
+            loss_computer.reset_stats()
 
 
 def train(model, criterion, dataset,
@@ -140,8 +144,10 @@ def train(model, criterion, dataset,
         else:
             scheduler = None
 
-    best_val_acc = 0
-    for epoch in range(epoch_offset, epoch_offset+args.n_epochs):
+    best_val_acc, best_test_acc, best_epoch = 0, 0, 0
+    test_wg_accs, test_avg_accs, test_ub_accs = [], [], []
+    
+    for epoch in tqdm(range(epoch_offset, epoch_offset+args.n_epochs)):
         logger.write('\nEpoch [%d]:\n' % epoch)
         logger.write(f'Training:\n')
         run_epoch(
@@ -161,13 +167,14 @@ def train(model, criterion, dataset,
             dataset=dataset['val_data'],
             step_size=args.robust_step_size,
             alpha=args.alpha)
-        run_epoch(
+        val_accs = run_epoch(
             epoch, model, optimizer,
             dataset['val_loader'],
             val_loss_computer,
             logger, val_csv_logger, args,
             is_training=False)
 
+        logger.write(f'\nTest:\n')
         # Test set; don't print to avoid peeking
         if dataset['test_data'] is not None:
             test_loss_computer = LossComputer(
@@ -176,13 +183,28 @@ def train(model, criterion, dataset,
                 dataset=dataset['test_data'],
                 step_size=args.robust_step_size,
                 alpha=args.alpha)
-            run_epoch(
+            avg_acc, ub_acc, wg_acc = run_epoch(
                 epoch, model, optimizer,
                 dataset['test_loader'],
                 test_loss_computer,
-                None, test_csv_logger, args,
+                logger, test_csv_logger, args,
                 is_training=False)
+            test_avg_accs.append(avg_acc)
+            test_ub_accs.append(ub_acc)
+            test_wg_accs.append(wg_acc)
+        
+        val_ub_acc = val_accs[1] # unbiased accuracy
+        curr_val_acc = val_ub_acc
+        curr_test_acc = ub_acc
 
+        if curr_val_acc >= best_val_acc or epoch == 0:
+            best_val_acc = curr_val_acc
+            best_test_acc = curr_test_acc
+            is_best = True
+            best_epoch = epoch
+        else:
+            is_best = False
+        
         # Inspect learning rates
         if (epoch+1) % 1 == 0:
             for param_group in optimizer.param_groups:
@@ -202,16 +224,14 @@ def train(model, criterion, dataset,
         if args.save_last:
             torch.save(model, os.path.join(args.log_dir, 'last_model.pth'))
 
-        if args.save_best:
-            if args.robust or args.reweight_groups:
-                curr_val_acc = min(val_loss_computer.avg_group_acc)
-            else:
-                curr_val_acc = val_loss_computer.avg_acc
-            logger.write(f'Current validation accuracy: {curr_val_acc}\n')
-            if curr_val_acc > best_val_acc:
-                best_val_acc = curr_val_acc
-                torch.save(model, os.path.join(args.log_dir, 'best_model.pth'))
-                logger.write(f'Best model saved at epoch {epoch}\n')
+        if args.robust or args.reweight_groups:
+            curr_val_acc = min(val_loss_computer.avg_group_acc)
+        else:
+            curr_val_acc = val_loss_computer.avg_acc
+        if curr_val_acc > best_val_acc:
+            best_val_acc = curr_val_acc
+            torch.save(model, os.path.join(args.log_dir, 'best_model.pth'))
+            logger.write(f'Best model saved at epoch {epoch}\n')
 
         if args.automatic_adjustment:
             gen_gap = val_loss_computer.avg_group_loss - train_loss_computer.exp_avg_loss
@@ -222,4 +242,11 @@ def train(model, criterion, dataset,
                 logger.write(
                     f'  {train_loss_computer.get_group_name(group_idx)}:\t'
                     f'adj = {train_loss_computer.adj[group_idx]:.3f}\n')
+        
+        logger.write(f'Current validation acc: {curr_val_acc:.4f}\n')
+        logger.write(f'Current {epoch} test avg acc: {avg_acc:.4f}, unbiased acc: {ub_acc:.4f}, worst acc: {wg_acc:.4f}\n')
+        if is_best: logger.write(f'New best!\n')
+        logger.write(f'Best epoch {best_epoch} of val acc {best_val_acc:.4f}: avg acc {test_avg_accs[best_epoch]:.4f}, unbiased acc: {test_ub_accs[best_epoch]:.4f}, worst acc: {test_wg_accs[best_epoch]:.4f}\n')        
+
+        logger.write('\n')
         logger.write('\n')
